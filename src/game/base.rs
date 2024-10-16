@@ -1488,7 +1488,9 @@ impl PostFlopGame {
         Ok(json_config)
     }
 
-    pub fn game_from_configs_json(configs_json: serde_json::Value) -> Result<PostFlopGame, String> {
+    pub fn game_from_configs_json(
+        configs_json: &serde_json::Value,
+    ) -> Result<PostFlopGame, String> {
         let map = configs_json.as_object().ok_or({
             "Config JSON must be a JSON object with keys \"tree_config\" and \"card_config\""
         })?;
@@ -1499,9 +1501,9 @@ impl PostFlopGame {
             .get("card_config")
             .ok_or("Config JSON must contain key \"card_config\"")?;
         let tree_config: TreeConfig = serde_json::from_value(tree_config.clone())
-            .map_err(|_| "Error deserializing tree_config")?;
+            .map_err(|e| format!("Error deserializing tree_config: {:?}", e))?;
         let card_config: CardConfig = serde_json::from_value(card_config.clone())
-            .map_err(|_| "Error deserializing card_config")?;
+            .map_err(|e| format!("Error deserializing card_config: {:?}", e))?;
         let action_tree = ActionTree::new(tree_config)?;
         PostFlopGame::with_config(card_config, action_tree)
     }

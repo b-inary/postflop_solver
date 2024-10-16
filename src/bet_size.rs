@@ -1,6 +1,6 @@
 #[cfg(feature = "bincode")]
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Bet size options for the first bets and raises.
 ///
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// let bet_size = BetSizeOptions::try_from(("50%, 100c, 2e, a", "2.5x")).unwrap();
 ///
 /// assert_eq!(
-///     bet_size.bet,
+///     bet_size.bets(),
 ///     vec![
 ///         PotRelative(0.5),
 ///         Additive(100, 0),
@@ -36,16 +36,20 @@ use serde::{Deserialize, Serialize};
 ///    ]
 /// );
 ///
-/// assert_eq!(bet_size.raise, vec![PrevBetRelative(2.5)]);
+/// assert_eq!(bet_size.raises(), vec![PrevBetRelative(2.5)]);
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bincode", derive(Decode, Encode))]
 pub struct BetSizeOptions {
     /// Bet size options for first bet.
-    pub bet: Vec<BetSize>,
+    #[serde(deserialize_with = "deserialize_bet_sizes", default)]
+    #[serde(serialize_with = "serialize_bet_sizes")]
+    bets: Vec<BetSize>,
 
     /// Bet size options for raise.
-    pub raise: Vec<BetSize>,
+    #[serde(deserialize_with = "deserialize_bet_sizes", default)]
+    #[serde(serialize_with = "serialize_bet_sizes")]
+    raises: Vec<BetSize>,
 }
 
 /// Bet size options for the donk bets.
@@ -54,12 +58,15 @@ pub struct BetSizeOptions {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bincode", derive(Decode, Encode))]
 pub struct DonkSizeOptions {
-    pub donk: Vec<BetSize>,
+    #[serde(deserialize_with = "deserialize_bet_sizes", default)]
+    #[serde(serialize_with = "serialize_bet_sizes")]
+    donks: Vec<BetSize>,
 }
 
 /// Bet size specification.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(feature = "bincode", derive(Decode, Encode))]
+#[serde(try_from = "&str")]
 pub enum BetSize {
     /// Bet size relative to the current pot size.
     PotRelative(f64),
@@ -81,6 +88,63 @@ pub enum BetSize {
     AllIn,
 }
 
+impl BetSizeOptions {
+    /// Tries to create a `BetSizeOptions` from two `BetSize` vecs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when:
+    /// - `bets` contains a `BetSize::Relative` bet size
+    /// - `bets` contains an `BetSize::Additive(_, cap)` with non-zero `cap`
+    pub fn try_from_sizes(bets: Vec<BetSize>, raises: Vec<BetSize>) -> Result<Self, String> {
+        Ok(BetSizeOptions {
+            bets: BetSizeOptions::as_valid_bets(bets)?,
+            raises,
+        })
+    }
+
+    /// Check `bets` for well-formedness (no sizes relative to previous bet and
+    /// no raise caps) and return it. Return an `Err` if:
+    /// - `bets` contains a `BetSize::Relative` bet size
+    /// - `bets` contains an `BetSize::Additive(_, cap)` with non-zero `cap`
+    pub fn as_valid_bets(bets: Vec<BetSize>) -> Result<Vec<BetSize>, String> {
+        for bs in bets.iter() {
+            match &bs {
+                BetSize::PrevBetRelative(_) => {
+                    let err_msg = "bets cannot contain `BetSize::PrevBetRelative".to_string();
+                    return Err(err_msg);
+                }
+                BetSize::Additive(_, cap) => {
+                    if cap != &0 {
+                        let err_msg =
+                            "bets cannot contain additive bet sizes with non-zero raise caps"
+                                .to_string();
+                        return Err(err_msg);
+                    }
+                }
+                _ => (),
+            }
+        }
+        Ok(bets)
+    }
+
+    pub fn bets(&self) -> &[BetSize] {
+        &self.bets
+    }
+
+    pub fn raises(&self) -> &[BetSize] {
+        &self.raises
+    }
+}
+
+impl TryFrom<&str> for BetSize {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        bet_size_from_str(s)
+    }
+}
+
 impl TryFrom<(&str, &str)> for BetSizeOptions {
     type Error = String;
 
@@ -88,32 +152,13 @@ impl TryFrom<(&str, &str)> for BetSizeOptions {
     ///
     /// See the [`BetSizeOptions`] struct for the description and examples.
     fn try_from((bet_str, raise_str): (&str, &str)) -> Result<Self, Self::Error> {
-        let mut bet_sizes = bet_str.split(',').map(str::trim).collect::<Vec<_>>();
-        let mut raise_sizes = raise_str.split(',').map(str::trim).collect::<Vec<_>>();
+        Self::try_from_sizes(bet_sizes_from_str(bet_str)?, bet_sizes_from_str(raise_str)?)
+    }
+}
 
-        if bet_sizes.last().unwrap().is_empty() {
-            bet_sizes.pop();
-        }
-
-        if raise_sizes.last().unwrap().is_empty() {
-            raise_sizes.pop();
-        }
-
-        let mut bet = Vec::new();
-        let mut raise = Vec::new();
-
-        for bet_size in bet_sizes {
-            bet.push(bet_size_from_str(bet_size, false)?);
-        }
-
-        for raise_size in raise_sizes {
-            raise.push(bet_size_from_str(raise_size, true)?);
-        }
-
-        bet.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
-        raise.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
-
-        Ok(BetSizeOptions { bet, raise })
+impl DonkSizeOptions {
+    pub fn donks(&self) -> &[BetSize] {
+        &self.donks
     }
 }
 
@@ -124,21 +169,39 @@ impl TryFrom<&str> for DonkSizeOptions {
     ///
     /// See the [`BetSizeOptions`] struct for the description and examples.
     fn try_from(donk_str: &str) -> Result<Self, Self::Error> {
-        let mut donk_sizes = donk_str.split(',').map(str::trim).collect::<Vec<_>>();
+        let donks = bet_sizes_from_str(donk_str)?;
+        let donks = BetSizeOptions::as_valid_bets(donks)?;
+        Ok(DonkSizeOptions { donks })
+    }
+}
 
-        if donk_sizes.last().unwrap().is_empty() {
-            donk_sizes.pop();
+impl From<BetSize> for String {
+    fn from(bet_size: BetSize) -> Self {
+        match bet_size {
+            BetSize::PotRelative(x) => format!("{}%", 100.0 * x),
+            BetSize::PrevBetRelative(x) => format!("{}x", x),
+            BetSize::Additive(c, r) => {
+                if r != 0 {
+                    format!("{}c{}r", c, r)
+                } else {
+                    format!("{}c", c)
+                }
+            }
+            BetSize::Geometric(n, r) => {
+                if n == 0 {
+                    if r == f64::INFINITY {
+                        "e".to_string()
+                    } else {
+                        format!("e{}", r * 100.0)
+                    }
+                } else if r == f64::INFINITY {
+                    format!("{}e", n)
+                } else {
+                    format!("{}e{}", n, r)
+                }
+            }
+            BetSize::AllIn => "a".to_string(),
         }
-
-        let mut donk = Vec::new();
-
-        for donk_size in donk_sizes {
-            donk.push(bet_size_from_str(donk_size, false)?);
-        }
-
-        donk.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
-
-        Ok(DonkSizeOptions { donk })
     }
 }
 
@@ -150,23 +213,45 @@ fn parse_float(s: &str) -> Option<f64> {
     }
 }
 
-fn bet_size_from_str(s: &str, is_raise: bool) -> Result<BetSize, String> {
+fn bet_sizes_from_str(bets_str: &str) -> Result<Vec<BetSize>, String> {
+    let mut bet_sizes = bets_str.split(',').map(str::trim).collect::<Vec<_>>();
+
+    if bet_sizes.last().unwrap().is_empty() {
+        bet_sizes.pop();
+    }
+
+    let mut bets = Vec::new();
+
+    for bet_size in bet_sizes {
+        bets.push(bet_size_from_str(bet_size)?);
+    }
+
+    bets.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
+
+    Ok(bets)
+}
+
+fn deserialize_bet_sizes<'de, D>(deserializer: D) -> Result<Vec<BetSize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let bet_sizes = bet_sizes_from_str(&s);
+    bet_sizes.map_err(de::Error::custom)
+}
+
+fn bet_size_from_str(s: &str) -> Result<BetSize, String> {
     let s_lower = s.to_lowercase();
     let err_msg = format!("Invalid bet size: {s}");
 
     if let Some(prev_bet_rel) = s_lower.strip_suffix('x') {
         // Previous bet relative
-        if !is_raise {
-            let err_msg = format!("Relative size to the previous bet is not allowed: {s}");
+        let float = parse_float(prev_bet_rel).ok_or(&err_msg)?;
+        if float <= 1.0 {
+            let err_msg = format!("Multiplier must be greater than 1.0: {s}");
             Err(err_msg)
         } else {
-            let float = parse_float(prev_bet_rel).ok_or(&err_msg)?;
-            if float <= 1.0 {
-                let err_msg = format!("Multiplier must be greater than 1.0: {s}");
-                Err(err_msg)
-            } else {
-                Ok(BetSize::PrevBetRelative(float))
-            }
+            Ok(BetSize::PrevBetRelative(float))
         }
     } else if s_lower.contains('c') {
         // Additive
@@ -185,10 +270,6 @@ fn bet_size_from_str(s: &str, is_raise: bool) -> Result<BetSize, String> {
         let cap = if cap_str.is_empty() {
             0
         } else {
-            if !is_raise {
-                let err_msg = format!("Raise cap is not allowed: {s}");
-                return Err(err_msg);
-            }
             let float_str = cap_str.strip_suffix('r').ok_or(&err_msg)?;
             let float = parse_float(float_str).ok_or(&err_msg)?;
             if float.trunc() != float || float == 0.0 {
@@ -251,6 +332,23 @@ fn bet_size_from_str(s: &str, is_raise: bool) -> Result<BetSize, String> {
     }
 }
 
+pub fn bet_size_to_string(bs: &BetSize) -> String {
+    String::from(*bs)
+}
+
+pub fn serialize_bet_sizes<S>(bs: &[BetSize], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_str(
+        bs.iter()
+            .map(|b| String::from(*b))
+            .collect::<Vec<String>>()
+            .join(",")
+            .as_str(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::BetSize::*;
@@ -278,7 +376,7 @@ mod tests {
         ];
 
         for (s, expected) in tests {
-            assert_eq!(bet_size_from_str(s, true), Ok(expected));
+            assert_eq!(bet_size_from_str(s), Ok(expected));
         }
 
         let error_tests = [
@@ -288,7 +386,7 @@ mod tests {
         ];
 
         for s in error_tests {
-            assert!(bet_size_from_str(s, true).is_err());
+            assert!(bet_size_from_str(s).is_err());
         }
     }
 
@@ -298,18 +396,20 @@ mod tests {
             (
                 "40%, 70%",
                 "",
-                BetSizeOptions {
-                    bet: vec![PotRelative(0.4), PotRelative(0.7)],
-                    raise: Vec::new(),
-                },
+                BetSizeOptions::try_from_sizes(
+                    vec![PotRelative(0.4), PotRelative(0.7)],
+                    Vec::new(),
+                )
+                .unwrap(),
             ),
             (
                 "50c, e, a,",
                 "25%, 2.5x, e200%",
-                BetSizeOptions {
-                    bet: vec![Additive(50, 0), Geometric(0, f64::INFINITY), AllIn],
-                    raise: vec![PotRelative(0.25), PrevBetRelative(2.5), Geometric(0, 2.0)],
-                },
+                BetSizeOptions::try_from_sizes(
+                    vec![Additive(50, 0), Geometric(0, f64::INFINITY), AllIn],
+                    vec![PotRelative(0.25), PrevBetRelative(2.5), Geometric(0, 2.0)],
+                )
+                .unwrap(),
             ),
         ];
 
@@ -330,13 +430,13 @@ mod tests {
             (
                 "40%, 70%",
                 DonkSizeOptions {
-                    donk: vec![PotRelative(0.4), PotRelative(0.7)],
+                    donks: vec![PotRelative(0.4), PotRelative(0.7)],
                 },
             ),
             (
                 "50c, e, a,",
                 DonkSizeOptions {
-                    donk: vec![Additive(50, 0), Geometric(0, f64::INFINITY), AllIn],
+                    donks: vec![Additive(50, 0), Geometric(0, f64::INFINITY), AllIn],
                 },
             ),
         ];

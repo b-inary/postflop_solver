@@ -993,6 +993,8 @@ impl<'de> Deserialize<'de> for Range {
     {
         struct RangeVisitor;
 
+        // A workaround in a clippy bug
+        #[allow(clippy::needless_lifetimes)]
         impl<'de> Visitor<'de> for RangeVisitor {
             type Value = Range;
 
